@@ -1,26 +1,30 @@
-from flask import Flask, redirect, request, jsonify
+from flask import Flask, redirect, jsonify, Response
 import requests, urllib.parse
 
+PPUBS_HOME = "https://ppubs.uspto.gov/pubwebapp/static/pages/ppubsbasic.html"
 PPUBS_SEARCH = "https://ppubs.uspto.gov/api/searches/generic"
 PPUBS_PDF = "https://ppubs.uspto.gov/api/pdf/downloadPdf/{doc_id}"
 
-def default_headers():
-    # Try to mimic a real browser as closely as possible
-    return {
+def browser_headers(extra=None):
+    h = {
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
         "origin": "https://ppubs.uspto.gov",
-        "referer": "https://ppubs.uspto.gov/pubwebapp/static/pages/ppubsbasic.html",
+        "referer": PPUBS_HOME,
         "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-        "sec-ch-ua": '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
-        "sec-ch-ua-platform": '"macOS"',
-        "sec-ch-ua-mobile": "?0",
+        "accept-language": "en-US,en;q=0.9",
+        "x-requested-with": "XMLHttpRequest",
+        "pragma": "no-cache",
+        "cache-control": "no-cache",
     }
+    if extra:
+        h.update(extra)
+    return h
 
-def search_body_for_doc(doc_id: str):
+def search_body(doc_id: str):
     return {
         "cursorMarker": "*",
-        "databaseFilters": [{"databaseName": "USPAT"}, {"databaseName": "US-PGPUB"}, {"databaseName": "USOCR"}],
+        "databaseFilters": [{"databaseName":"USPAT"},{"databaseName":"US-PGPUB"},{"databaseName":"USOCR"}],
         "fields": ["documentId","patentNumber","title","datePublished","inventors","pageCount","type"],
         "op": "OR",
         "pageSize": 1,
@@ -35,46 +39,59 @@ app = Flask(__name__)
 def health():
     return "ok", 200
 
-@app.route("/patent/<doc_id>")
-def proxy(doc_id):
+def fetch_token_and_redirect(doc_id: str):
     s = requests.Session()
-    headers = default_headers()
 
-    # 1) First attempt without token (some servers return a fresh x-access-token header with 401)
-    r = s.post(PPUBS_SEARCH, json=search_body_for_doc(doc_id), headers=headers, allow_redirects=False)
-    token = r.headers.get("x-access-token")
+    # 0) Warm cookies by loading the public page
+    s.get(PPUBS_HOME, headers={"user-agent": browser_headers()["user-agent"], "accept-language": "en-US,en;q=0.9"}, timeout=20)
 
-    # If unauthorized and token was provided by server, retry with token
-    if (r.status_code == 401 or r.status_code == 403) and token:
-        headers["x-access-token"] = token
-        r = s.post(PPUBS_SEARCH, json=search_body_for_doc(doc_id), headers=headers, allow_redirects=False)
+    # 1) First attempt (no token)
+    r1 = s.post(PPUBS_SEARCH, json=search_body(doc_id), headers=browser_headers(), allow_redirects=False, timeout=30)
+    tok = r1.headers.get("x-access-token")
 
-    # Last chance: if still unauthorized but server sent a token in this response, try once more
-    if (r.status_code == 401 or r.status_code == 403) and not headers.get("x-access-token"):
-        token = r.headers.get("x-access-token")
-        if token:
-            headers["x-access-token"] = token
-            r = s.post(PPUBS_SEARCH, json=search_body_for_doc(doc_id), headers=headers, allow_redirects=False)
+    # 2) If unauthorized, try with a dummy token to elicit a real one
+    if (r1.status_code in (401,403)) and not tok:
+        r2 = s.post(PPUBS_SEARCH, json=search_body(doc_id), headers=browser_headers({"x-access-token":"placeholder"}), allow_redirects=False, timeout=30)
+        tok = r2.headers.get("x-access-token")
+        last = r2
+    else:
+        last = r1
 
-    # If we have a token (from either attempt), build the download URL using it.
-    # Empirically, the same header token often works as requestToken for download.
-    token = headers.get("x-access-token") or r.headers.get("x-access-token")
-    if not token:
-        # As a fallback, try to read a requestToken-like value from JSON (if present in future API changes)
+    # 3) If we have a token, try one more POST with it (sometimes refreshes token)
+    if tok:
+        r3 = s.post(PPUBS_SEARCH, json=search_body(doc_id), headers=browser_headers({"x-access-token":tok}), allow_redirects=False, timeout=30)
+        tok = r3.headers.get("x-access-token") or tok
+        last = r3
+
+    # 4) If still no token, return diagnostics
+    if not tok:
+        info = {
+            "step1_status": r1.status_code,
+            "step1_headers": dict(r1.headers),
+        }
         try:
-            js = r.json()
-            token = js.get("requestToken") or js.get("token")
+            info["step1_body_snippet"] = r1.text[:500]
         except Exception:
             pass
+        return None, info
 
-    if not token:
-        return (f"Could not obtain access token from USPTO (status={r.status_code}). "
-                f"Try again or visit ppubs.uspto.gov manually.", 502)
+    # 5) Redirect to PDF with token
+    pdf_url = PPUBS_PDF.format(doc_id=urllib.parse.quote(doc_id)) + "?requestToken=" + urllib.parse.quote(tok)
+    return pdf_url, None
 
-    # 2) Redirect the client to ppubs with the (fresh) token—address bar shows ppubs.uspto.gov
-    pdf_url = PPUBS_PDF.format(doc_id=urllib.parse.quote(doc_id))
-    pdf_url = f"{pdf_url}?requestToken={urllib.parse.quote(token)}"
-    return redirect(pdf_url, code=302)
+@app.route("/patent/<doc_id>")
+def patent(doc_id):
+    pdf_url, diag = fetch_token_and_redirect(doc_id)
+    if pdf_url:
+        return redirect(pdf_url, code=302)
+    return jsonify({"error": "Could not obtain token", "details": diag}), 502
+
+@app.route("/debug/<doc_id>")
+def debug(doc_id):
+    pdf_url, diag = fetch_token_and_redirect(doc_id)
+    if pdf_url:
+        return jsonify({"success": True, "redirect_to": pdf_url})
+    return jsonify({"success": False, "details": diag}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
