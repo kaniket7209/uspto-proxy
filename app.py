@@ -1,8 +1,8 @@
 from flask import Flask, redirect, jsonify, request
 import requests, urllib.parse, os, threading
 
-PPUBS_HOME = "https://ppubs.uspto.gov/pubwebapp/static/pages/ppubsbasic.html"
-PPUBS_SEARCH = "https://ppubs.uspto.gov/api/searches/generic"
+PPUBS_HOME  = "https://ppubs.uspto.gov/pubwebapp/static/pages/ppubsbasic.html"
+PPUBS_SEARCH= "https://ppubs.uspto.gov/api/searches/generic"
 PPUBS_PDF   = "https://ppubs.uspto.gov/api/pdf/downloadPdf/{doc_id}"
 
 # In-memory token cache (process-local)
@@ -25,7 +25,7 @@ app = Flask(__name__)
 def index():
     return (
         "USPTO proxy is up.\n"
-        "Use /patent/<doc_id>         -> tries to refresh token via search, then redirects\n"
+        "Use /patent/<doc_id>         -> auto-refresh token on 401 and redirect\n"
         "Use /patent_direct/<doc_id>  -> uses provided/cached token and redirects (no search)\n"
         "Use /debug/<doc_id>          -> diagnostics\n"
         "Use /set_token?token=XYZ&secret=... (needs TOKEN_SECRET)\n"
@@ -46,7 +46,7 @@ def browser_headers(extra=None):
         "x-requested-with": "XMLHttpRequest",
         "pragma": "no-cache",
         "cache-control": "no-cache",
-        # These are advisory; many servers ignore them server-side
+        # advisory hints
         "sec-fetch-site": "same-origin",
         "sec-fetch-mode": "cors",
         "sec-fetch-dest": "empty",
@@ -71,20 +71,6 @@ def search_body(doc_id: str):
         "sort": "date_publ desc"
     }
 
-def try_search_with_token(session: requests.Session, token: str, doc_id: str):
-    r = session.post(
-        PPUBS_SEARCH,
-        json=search_body(doc_id),
-        headers=browser_headers({"x-access-token": token}),
-        allow_redirects=False,
-        timeout=30
-    )
-    new_tok = r.headers.get("x-access-token")
-    return r, (new_tok or token)
-
-def build_pdf_url(doc_id: str, token: str) -> str:
-    return PPUBS_PDF.format(doc_id=urllib.parse.quote(doc_id)) + "?requestToken=" + urllib.parse.quote(token)
-
 def warm_cookies(session: requests.Session):
     try:
         session.get(
@@ -98,104 +84,97 @@ def warm_cookies(session: requests.Session):
     except Exception:
         pass
 
-def fetch_pdf_redirect(doc_id: str):
-    """
-    Full flow: try existing token (query/cached/env), else try to elicit one via search POSTs.
-    Returns (redirect_url, diag_info or None)
-    """
-    # Token priority: query param > cached > env var
-    token = (request.args.get("token") or
-             get_cached_token() or
-             os.getenv("X_ACCESS_TOKEN", "").strip())
+def build_pdf_url(doc_id: str, token: str) -> str:
+    return PPUBS_PDF.format(doc_id=urllib.parse.quote(doc_id)) + "?requestToken=" + urllib.parse.quote(token)
 
+def try_search(session: requests.Session, token: str|None, doc_id: str):
+    """POST /searches/generic with optional token; return (status_code, new_token_or_None)."""
+    headers = browser_headers()
+    if token:
+        headers["x-access-token"] = token
+    r = session.post(PPUBS_SEARCH, json=search_body(doc_id), headers=headers, allow_redirects=False, timeout=30)
+    return r.status_code, r.headers.get("x-access-token")
+
+def ensure_fresh_token(doc_id: str, seed_token: str|None) -> str|None:
+    """
+    Returns a usable token (possibly refreshed) or None if unable.
+    Strategy:
+      1) Warm cookies.
+      2) Try current token; if 401/403 or no new token, try placeholder to elicit a fresh token.
+      3) If a token appears, cache & return it.
+    """
     s = requests.Session()
     warm_cookies(s)
 
-    # If we already have a token, try a search POST to refresh it (best effort),
-    # then redirect with whichever token we have.
-    if token:
-        r, token = try_search_with_token(s, token, doc_id)
-        if token:
-            set_cached_token(token)
-            return build_pdf_url(doc_id, token), {"status": r.status_code, "had_token": True}
+    # 1) Try with current token if present
+    if seed_token:
+        status, new_tok = try_search(s, seed_token, doc_id)
+        if new_tok:
+            set_cached_token(new_tok)
+            return new_tok
+        if status in (200, 201):
+            # No new token but old might still be OK
+            return seed_token
+        # else fall through to placeholder
 
-    # No token yet: try to elicit one
-    r1 = s.post(PPUBS_SEARCH, json=search_body(doc_id),
-                headers=browser_headers(), allow_redirects=False, timeout=30)
-    tok = r1.headers.get("x-access-token")
+    # 2) Try with placeholder to coax a fresh token
+    status2, new_tok2 = try_search(s, "placeholder", doc_id)
+    if new_tok2:
+        set_cached_token(new_tok2)
+        return new_tok2
 
-    if (r1.status_code in (401, 403)) and not tok:
-        r2 = s.post(PPUBS_SEARCH, json=search_body(doc_id),
-                    headers=browser_headers({"x-access-token": "placeholder"}),
-                    allow_redirects=False, timeout=30)
-        tok = r2.headers.get("x-access-token")
-        last = r2
-    else:
-        last = r1
+    # 3) As a last attempt, try without any token (some deployments issue on bare call)
+    status3, new_tok3 = try_search(s, None, doc_id)
+    if new_tok3:
+        set_cached_token(new_tok3)
+        return new_tok3
 
-    if tok:
-        set_cached_token(tok)
-        return build_pdf_url(doc_id, tok), {"status": last.status_code, "had_token": False}
-
-    # fail with diagnostics
-    info = {
-        "step1_status": r1.status_code,
-        "step1_headers": dict(r1.headers),
-        "hint": "Provide a working x-access-token via env X_ACCESS_TOKEN or /set_token?token=..."
-    }
-    try:
-        info["step1_body_snippet"] = r1.text[:500]
-    except Exception:
-        pass
-    return None, info
+    return None
 
 @app.get("/patent/<doc_id>")
 def patent(doc_id):
-    # Use cached token (seeded once via /set_token or first browser call)
+    """
+    Permanent link:
+      - get cached (or hardcoded seed) token
+      - ensure it's fresh (auto-renew on 401/403)
+      - redirect to live PDF with the freshest token
+    """
     token = get_cached_token()
     if not token:
-        # fallback: load once from your known good token at startup
+        # seed once with a known-good token you captured from your browser (optional)
         token = "eyJzdWIiOiI2NDAzODQzYy02ODdjLTRlZjktOTJmYS0xYzA1ZmJiNWYxOWYiLCJ2ZXIiOiI0NjY3ODEzYy1kOTExLTRlOTgtOWY3My1jM2MwYWI4NmViMTIiLCJleHAiOjB9"
         set_cached_token(token)
 
-    # 1️⃣ Try the existing token on /api/searches/generic to refresh it
-    s = requests.Session()
-    body = search_body(doc_id)
-    r = s.post(PPUBS_SEARCH, json=body, headers=browser_headers({"x-access-token": token}))
-    new_tok = r.headers.get("x-access-token")
-    if new_tok:
-        set_cached_token(new_tok)
-        token = new_tok
+    fresh = ensure_fresh_token(doc_id, token)
+    if not fresh:
+        # if we truly can't refresh, try with the old token anyway (may still succeed)
+        return redirect(build_pdf_url(doc_id, token), code=302)
 
-    # 2️⃣ Redirect to PDF using the freshest token
-    pdf_url = build_pdf_url(doc_id, token)
-    return redirect(pdf_url, code=302)
-
+    return redirect(build_pdf_url(doc_id, fresh), code=302)
 
 @app.get("/patent_direct/<doc_id>")
 def patent_direct(doc_id):
     """
-    Skip the search step and just redirect using a provided/cached/env token.
-    Useful for local testing when you copy a working x-access-token from the browser.
+    Skip search: just use provided/cached token and redirect.
+    Useful for manual tests with ?token=...
     """
-    token = (request.args.get("token") or
-             get_cached_token() or
-             os.getenv("X_ACCESS_TOKEN", "").strip())
+    token = (request.args.get("token") or get_cached_token() or "").strip()
     if not token:
-        return jsonify({"error": "No token available. Pass ?token=... or set X_ACCESS_TOKEN env."}), 400
+        return jsonify({"error": "No token available. Pass ?token=..."}), 400
     set_cached_token(token)
     return redirect(build_pdf_url(doc_id, token), code=302)
 
 @app.get("/debug/<doc_id>")
 def debug(doc_id):
-    url, diag = fetch_pdf_redirect(doc_id)
-    if url:
-        return jsonify({"success": True, "redirect_to": url})
-    return jsonify({"success": False, "details": diag})
+    token = request.args.get("token") or get_cached_token()
+    result = {"had_cached_token": bool(get_cached_token()), "used_query_token": bool(request.args.get("token"))}
+    fresh = ensure_fresh_token(doc_id, token)
+    result["fresh_token_obtained"] = bool(fresh)
+    result["will_redirect_to"] = build_pdf_url(doc_id, fresh or (token or "<none>"))
+    return jsonify(result)
 
 @app.get("/set_token")
 def set_token():
-    # Prefer env var; fall back to the value you pasted so it still works if env unset
     secret_env = os.getenv("TOKEN_SECRET", "").strip()
     secret_fallback = "eyJzdWIiOiI2NDAzODQzYy02ODdjLTRlZjktOTJmYS0xYzA1ZmJiNWYxOWYiLCJ2ZXIiOiI5ZTBjMDZhNy0xMjQ0LTQwZTctOTk0Mi1kMzRhYzQwNzkxNGUiLCJleHAiOjB9"
     secret = secret_env or secret_fallback
@@ -211,6 +190,6 @@ def set_token():
 
     set_cached_token(tok)
     return jsonify({"ok": True})
-    
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
